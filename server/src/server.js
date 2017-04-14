@@ -2,30 +2,33 @@
 var express = require('express');
 // Creates an Express server.
 var app = express();
-
-// Import the bodyParse for the middleware
+app.use(express.static('../client/build'));
+//import body parser for the middleware
 var bodyParser = require('body-parser');
 app.use(bodyParser.text());
+app.use(bodyParser.json());
 
-
-// Import the readDocument function from database.js
-var database = require('./database');
-var readDocument = database.readDocument;
-
-var StatusUpdateSchema = require('./schemas/statusupdate.json');
-var validate = require('express-jsonschema').validate;
+// Import functions from database and schemas
+var database = require('./database.js');
 var writeDocument = database.writeDocument;
 var addDocument = database.addDocument;
+var readDocument = database.readDocument;
+var StatusUpdateSchema = require('./schemas/statusupdate.json');
+var commentSchema = require('./schemas/comment.json');
+var validate = require('express-jsonschema').validate;
 
-
-
-// You run the server from `server`, so `../client/build` is `server/../client/build`.
-// '..' means "go up one directory", so this translates into `client/build`!
-app.use(express.static('../client/build'));
-// Support receiving text in HTTP request bodies
-app.use(bodyParser.text());
-// Support receiving JSON in HTTP request bodies
-app.use(bodyParser.json());
+/**
+ * Get the feed data for a particular user.
+ */
+function getFeedData(user) {
+  var userData = readDocument('users', user);
+  var feedData = readDocument('feeds', userData.feed);
+  // While map takes a callback, it is synchronous,
+  // not asynchronous. It calls the callback immediately.
+  feedData.contents = feedData.contents.map(getFeedItemSync);
+  // Return FeedData with resolved references.
+  return feedData;
+}
 
 /**
  * Adds a new status update to the database.
@@ -68,38 +71,16 @@ function postStatusUpdate(user, location, contents) {
   return newStatusUpdate;
 }
 
-// `POST /feeditem { userId: user, location: location, contents: contents  }`
-app.post('/feeditem',
-         validate({ body: StatusUpdateSchema }), function(req, res) {
-  // If this function runs, `req.body` passed JSON validation!
-  var body = req.body;
-  var fromUser = getUserIdFromToken(req.get('Authorization'));
-
-  // Check if requester is authorized to post this status update.
-  // (The requester must be the author of the update.)
-  if (fromUser === body.userId) {
-    var newUpdate = postStatusUpdate(body.userId, body.location, body.contents);
-    // When POST creates a new resource, we should tell the client about it
-    // in the 'Location' header and use status code 201.
-    res.status(201);
-    res.set('Location', '/feeditem/' + newUpdate._id);
-     // Send the update!
-    res.send(newUpdate);
-  } else {
-    // 401: Unauthorized.
-    res.status(401).end();
-  }
-});
-
 /**
  * Resolves a feed item. Internal to the server, since it's synchronous.
  */
 function getFeedItemSync(feedItemId) {
   var feedItem = readDocument('feedItems', feedItemId);
   // Resolve 'like' counter.
-  feedItem.likeCounter = feedItem.likeCounter.map((id) => readDocument('users', id));
-  // Assuming a StatusUpdate. If we had other types of FeedItems in the DB, we would
-  // need to check the type and have logic for each type.
+  feedItem.likeCounter = feedItem.likeCounter.map((id) =>
+                            readDocument('users', id));
+  // Assuming a StatusUpdate. If we had other types of FeedItems in the DB, we
+  // would need to check the type and have logic for each type.
   feedItem.contents.author = readDocument('users', feedItem.contents.author);
   // Resolve comment author.
   feedItem.comments.forEach((comment) => {
@@ -107,44 +88,6 @@ function getFeedItemSync(feedItemId) {
   });
   return feedItem;
 }
-
-// Update a feed item.
-app.put('/feeditem/:feeditemid/content', function(req, res) {
-  var fromUser = getUserIdFromToken(req.get('Authorization'));
-  var feedItemId = req.params.feeditemid;
-  var feedItem = readDocument('feedItems', feedItemId);
-  // Check that the requester is the author of this feed item.
-  if (fromUser === feedItem.contents.author) {
-    // Check that the body is a string, and not something like a JSON object.
-    // We can't use JSON validation here, since the body is simply text!
-    if (typeof(req.body) !== 'string') {
-      // 400: Bad request.
-      res.status(400).end();
-      return;
-    }
-    // Update text content of update.
-    feedItem.contents.contents = req.body;
-    writeDocument('feedItems', feedItem);
-    res.send(getFeedItemSync(feedItemId));
-  } else {
-    // 401: Unauthorized.
-    res.status(401).end();
-  }
-});
-
-/**
- * Emulates a REST call to get the feed data for a particular user.
- */
-function getFeedData(user) {
-  var userData = readDocument('users', user);
-  var feedData = readDocument('feeds', userData.feed);
-  // While map takes a callback, it is synchronous, not asynchronous.
-  // It calls the callback immediately.
-  feedData.contents = feedData.contents.map(getFeedItemSync);
-  // Return FeedData with resolved references.
-  return feedData;
-}
-module.exports.getFeedData = getFeedData;
 
 /**
  * Get the user ID from a token. Returns -1 (an invalid ID)
@@ -172,14 +115,94 @@ function getUserIdFromToken(authorizationLine) {
   }
 }
 
-// Reset database.
-app.post('/resetdb', function(req, res) {
-  console.log("Resetting database...");
-  // This is a debug route, so don't do any validation.
-  database.resetDatabase();
-  // res.send() sends an empty response with status code 200
-  res.send();
+// Post a comment
+app.post('/feeditem/:feeditemid/commentthread/comment',validate({ body: commentSchema}),function(req,res){
+   var body = req.body;
+   var fromUser = getUserIdFromToken(req.get('Authorization'));
+   var feedItemId = req.params.feeditemid;
+   var feedItem = readDocument('feedItems', feedItemId);
+   if (fromUser === body.author) {
+     feedItem.comments.push({
+       "author": body.author,
+       "contents": body.contents,
+       "postDate": new Date().getTime(),
+       "likeCounter": []
+     });
+     writeDocument('feedItems', feedItem);
+     res.status(201);
+     res.set('Location', '/feeditem/' + feedItem._id);
+     res.send(getFeedItemSync(feedItemId));
+   }
+   else {
+     res.status(401).end();
+   }
 });
+
+//  Like a comment
+ app.put('/feeditem/:feeditemid/commentThread/comment/:commentIdx/likelist/:userId',function(req,res){
+   var fromUser = getUserIdFromToken(req.get('Authorization'));
+   var feedItemId = parseInt(req.params.feeditemid,10);
+   var commentIdx = parseInt(req.params.commentIdx,10);
+   var userId = parseInt(req.params.userId,10);
+   if (fromUser === userId) {
+     var feedItem = readDocument('feedItems', feedItemId);
+     var comment = feedItem.comments[commentIdx];
+     if (comment.likeCounter.indexOf(userId)===-1) {
+       comment.likeCounter.push(userId);
+     }
+     writeDocument('feedItems', feedItem);
+     comment.author = readDocument('users', comment.author);
+     res.status(201);
+     res.send(comment);
+   } else {
+     res.send(401).end();
+   }
+ });
+
+// Unlike a comment
+ app.delete('/feeditem/:feeditemid/commentThread/comment/:commentIdx/likelist/:userId',function(req,res){
+   var fromUser = getUserIdFromToken(req.get('Authorization'));
+   var feedItemId = parseInt(req.params.feeditemid,10);
+   var commentIdx = parseInt(req.params.commentIdx,10);
+   var userId = parseInt(req.params.userId,10);
+   if (fromUser === userId) {
+     var feedItem = readDocument('feedItems', feedItemId);
+     var comment = feedItem.comments[commentIdx];
+     var index = comment.likeCounter.indexOf(userId);
+     if (index!==-1) {
+       comment.likeCounter.splice(index,1);
+     }
+     writeDocument('feedItems', feedItem);
+     comment.author = readDocument('users', comment.author);
+     res.status(201);
+     res.send(comment);
+   } else {
+    res.send(401).end();
+   }
+ });
+
+  // `POST /feeditem { userId: user, location: location, contents: contents  }`
+  app.post('/feeditem',validate({ body: StatusUpdateSchema }), function(req, res) {
+  // If this function runs, `req.body` passed JSON validation!
+  var body = req.body;
+  var fromUser = getUserIdFromToken(req.get('Authorization'));
+
+  // Check if requester is authorized to post this status update.
+  // (The requester must be the author of the update.)
+  if (fromUser === body.userId) {
+    var newUpdate = postStatusUpdate(body.userId, body.location, body.contents);
+    // When POST creates a new resource, we should tell the client about it
+    // in the 'Location' header and use status code 201.
+    res.status(201);
+    res.set('Location', '/feeditem/' + newUpdate._id);
+     // Send the update!
+    res.send(newUpdate);
+  } else {
+    // 401: Unauthorized.
+    res.status(401).end();
+  }
+});
+
 /**
  * Get the feed data for a particular user.
  */
@@ -198,9 +221,40 @@ app.get('/user/:userid/feed', function(req, res) {
   }
 });
 
-/**
- * Delete a feed item.
- */
+// Reset database.
+app.post('/resetdb', function(req, res) {
+  console.log("Resetting database...");
+  // This is a debug route, so don't do any validation.
+  database.resetDatabase();
+  // res.send() sends an empty response with status code 200
+  res.send();
+});
+
+// Update a feed item.
+app.put('/feeditem/:feeditemid/content', function(req, res) {
+  var fromUser = getUserIdFromToken(req.get('Authorization'));
+  var feedItemId = req.params.feeditemid;
+  var feedItem = readDocument('feedItems', feedItemId);
+  // Check that the requester is the author of this feed item.
+  if (fromUser === feedItem.contents.author) {
+    // Check that the body is a string, and not something like a JSON object.
+    // We can't use JSON validation here, since the body is simply text!
+    if (typeof(req.body) !== 'string') {
+      // 400: Bad request.
+      res.status(400).end();
+      return;
+    }
+    // Update text content of update.
+    feedItem.contents.contents = req.body;
+    writeDocument('feedItems', feedItem);
+    res.send(getFeedItemSync(feedItemId));
+  } else {
+    // 401: Unauthorized.
+    res.status(401).end();
+  }
+});
+
+// Delete a feed item.
 app.delete('/feeditem/:feeditemid', function(req, res) {
   var fromUser = getUserIdFromToken(req.get('Authorization'));
   // Convert from a string into a number.
@@ -227,6 +281,79 @@ app.delete('/feeditem/:feeditemid', function(req, res) {
   } else {
     // 401: Unauthorized.
     res.status(401).end();
+  }
+});
+
+// Like a feed item.
+app.put('/feeditem/:feeditemid/likelist/:userid', function(req, res) {
+  var fromUser = getUserIdFromToken(req.get('Authorization'));
+  // Convert params from string to number.
+  var feedItemId = parseInt(req.params.feeditemid, 10);
+  var userId = parseInt(req.params.userid, 10);
+  if (fromUser === userId) {
+    var feedItem = readDocument('feedItems', feedItemId);
+    // Add to likeCounter if not already present.
+    if (feedItem.likeCounter.indexOf(userId) === -1) {
+      feedItem.likeCounter.push(userId);
+      writeDocument('feedItems', feedItem);
+    }
+    // Return a resolved version of the likeCounter
+    res.send(feedItem.likeCounter.map((userId) => readDocument('users', userId)));
+  } else {
+    // 401: Unauthorized.
+    res.status(401).end();
+  }
+});
+
+// Unlike a feed item.
+app.delete('/feeditem/:feeditemid/likelist/:userid', function(req, res) {
+  var fromUser = getUserIdFromToken(req.get('Authorization'));
+  // Convert params from string to number.
+  var feedItemId = parseInt(req.params.feeditemid, 10);
+  var userId = parseInt(req.params.userid, 10);
+  if (fromUser === userId) {
+    var feedItem = readDocument('feedItems', feedItemId);
+    var likeIndex = feedItem.likeCounter.indexOf(userId);
+    // Remove from likeCounter if present
+    if (likeIndex !== -1) {
+      feedItem.likeCounter.splice(likeIndex, 1);
+      writeDocument('feedItems', feedItem);
+    }
+    // Return a resolved version of the likeCounter
+    // Note that this request succeeds even if the user already unliked the request!
+    res.send(feedItem.likeCounter.map((userId) => readDocument('users', userId)));
+  } else {
+    // 401: Unauthorized.
+    res.status(401).end();
+  }
+});
+
+// Search for feed item
+app.post('/search', function(req, res) {
+  var fromUser = getUserIdFromToken(req.get('Authorization'));
+  var user = readDocument('users', fromUser);
+  if (typeof(req.body) === 'string') {
+    // trim() removes whitespace before and after the query.
+    // toLowerCase() makes the query lowercase.
+    var queryText = req.body.trim().toLowerCase();
+    // Search the user's feed.
+    var feedItemIDs = readDocument('feeds', user.feed).contents;
+    // "filter" is like "map" in that it is a magic method for
+    // arrays. It takes an anonymous function, which it calls
+    // with each item in the array. If that function returns 'true',
+    // it will include the item in a return array. Otherwise, it will
+    // not.
+    // Here, we use filter to return only feedItems that contain the
+    // query text.
+    // Since the array contains feed item IDs, we later map the filtered
+    // IDs to actual feed item objects.
+    res.send(feedItemIDs.filter((feedItemID) => {
+      var feedItem = readDocument('feedItems', feedItemID);
+      return feedItem.contents.contents.toLowerCase().indexOf(queryText) !== -1;
+    }).map(getFeedItemSync));
+  } else {
+    // 400: Bad Request.
+    res.status(400).end();
   }
 });
 
