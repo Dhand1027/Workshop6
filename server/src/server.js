@@ -108,6 +108,30 @@ function getFeedItemSync(feedItemId) {
   return feedItem;
 }
 
+// Update a feed item.
+app.put('/feeditem/:feeditemid/content', function(req, res) {
+  var fromUser = getUserIdFromToken(req.get('Authorization'));
+  var feedItemId = req.params.feeditemid;
+  var feedItem = readDocument('feedItems', feedItemId);
+  // Check that the requester is the author of this feed item.
+  if (fromUser === feedItem.contents.author) {
+    // Check that the body is a string, and not something like a JSON object.
+    // We can't use JSON validation here, since the body is simply text!
+    if (typeof(req.body) !== 'string') {
+      // 400: Bad request.
+      res.status(400).end();
+      return;
+    }
+    // Update text content of update.
+    feedItem.contents.contents = req.body;
+    writeDocument('feedItems', feedItem);
+    res.send(getFeedItemSync(feedItemId));
+  } else {
+    // 401: Unauthorized.
+    res.status(401).end();
+  }
+});
+
 /**
  * Emulates a REST call to get the feed data for a particular user.
  */
@@ -148,6 +172,14 @@ function getUserIdFromToken(authorizationLine) {
   }
 }
 
+// Reset database.
+app.post('/resetdb', function(req, res) {
+  console.log("Resetting database...");
+  // This is a debug route, so don't do any validation.
+  database.resetDatabase();
+  // res.send() sends an empty response with status code 200
+  res.send();
+});
 /**
  * Get the feed data for a particular user.
  */
@@ -162,6 +194,38 @@ app.get('/user/:userid/feed', function(req, res) {
     res.send(getFeedData(userid));
   } else {
     // 401: Unauthorized request.
+    res.status(401).end();
+  }
+});
+
+/**
+ * Delete a feed item.
+ */
+app.delete('/feeditem/:feeditemid', function(req, res) {
+  var fromUser = getUserIdFromToken(req.get('Authorization'));
+  // Convert from a string into a number.
+  var feedItemId = parseInt(req.params.feeditemid, 10);
+  var feedItem = readDocument('feedItems', feedItemId);
+  // Check that the author of the post is requesting the delete.
+  if (feedItem.contents.author === fromUser) {
+    database.deleteDocument('feedItems', feedItemId);
+    // Remove references to this feed item from all other feeds.
+    var feeds = database.getCollection('feeds');
+    var feedIds = Object.keys(feeds);
+    feedIds.forEach((feedId) => {
+      var feed = feeds[feedId];
+      var itemIdx = feed.contents.indexOf(feedItemId);
+      if (itemIdx !== -1) {
+        // Splice out of array.
+        feed.contents.splice(itemIdx, 1);
+        // Update feed.
+        database.writeDocument('feeds', feed);
+      }
+    });
+    // Send a blank response to indicate success.
+    res.send();
+  } else {
+    // 401: Unauthorized.
     res.status(401).end();
   }
 });
